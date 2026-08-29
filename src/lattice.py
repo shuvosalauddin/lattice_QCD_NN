@@ -26,13 +26,16 @@ def apply_local_gauge_open(lx, ly, alpha):
     return wrap(lx_new), wrap(ly_new)
 
 
-def gauge_transform_periodic(f, u_x, u_y, alpha):
+def gauge_transform_periodic(f, u_x, u_y, alpha, charge=1):
     """
-    Local U(1) gauge transform (periodic BC) of a charge-+1 field + links.
-    Used by the gauge-equivariant CNN in models.py, which assumes periodic
-    boundaries via torch.roll — do not mix with the open-BC helpers above.
+    Local U(1) gauge transform (periodic BC) of a charge-`charge` field + links:
+        f(n)    -> g(n)^charge * f(n)
+        U_mu(n) -> g(n) * U_mu(n) * g(n+mu)^dagger   (links always transport charge 1)
+    Defaults to charge=1 (matter field) to match models.py. Used by the
+    gauge-equivariant CNN in models.py, which assumes periodic boundaries
+    via torch.roll — do not mix with the open-BC helpers above.
     """
     g = torch.polar(torch.ones_like(alpha), alpha)
     g_fwd_x = torch.roll(g, shifts=-1, dims=-2)
     g_fwd_y = torch.roll(g, shifts=-1, dims=-1)
-    return g * f, g * u_x * torch.conj(g_fwd_x), g * u_y * torch.conj(g_fwd_y)
+    return g**charge * f, g * u_x * torch.conj(g_fwd_x), g * u_y * torch.conj(g_fwd_y)
