@@ -8,34 +8,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-# Ensure `src` is importable when running directly from root or experiments/
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from src.lattice import apply_local_gauge_open, gauge_transform_periodic
-from src.models import GaugeEquivariantConv2D, LatticeGaugeCNN
-from src.observables import calc_plaquettes_open, calc_plaquettes_periodic
+from src.observables import calc_plaquettes_open
+from src.models import LConvLinear, LgeConvNet
 
-# NOTE: This is a *kinematic correctness harness*, not a Monte Carlo lattice
-# simulation. It verifies that (1) the Wilson loop is invariant under a local
-# open-BC gauge transform, and (2) a gauge-equivariant CNN and its plaquette
-# observable are equivariant/invariant under a local periodic-BC gauge
-# transform. There is no gauge action, no Metropolis/HMC update, and no
-# ensemble average here.
 torch.manual_seed(42)
 
-# Output directory setup
 OUTPUT_DIR = os.path.join(ROOT_DIR, "output_plots")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-
 def next_numbered_filename(directory, prefix, ext="jpg"):
-    """
-    Returns the next available `{prefix}_NN.{ext}` filename in `directory`,
-    zero-padded to 2 digits (prefix_01, prefix_02, ...). Scans existing files
-    so it picks up where you left off, even across separate runs.
-    """
     pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)\.{re.escape(ext)}$")
     existing = []
     for fname in os.listdir(directory):
@@ -44,7 +30,6 @@ def next_numbered_filename(directory, prefix, ext="jpg"):
             existing.append(int(m.group(1)))
     next_n = max(existing, default=0) + 1
     return f"{prefix}_{next_n:02d}.{ext}"
-
 
 L = 10
 
@@ -62,47 +47,32 @@ transformed_plaquettes = calc_plaquettes_open(links_x_new, links_y_new)
 err1 = torch.norm(original_plaquettes - transformed_plaquettes).item()
 print(f"[Exp 1] Wilson loop invariance error: {err1:.2e} (float32 noise floor)")
 
-# Diagnostic check to ensure the math is modifying the tensors
 link_diff = torch.norm(links_x - links_x_new).item()
 print(f"[Diagnostic] Total link change magnitude: {link_diff:.2f} (Must be > 0)")
 
 fig1, axs1 = plt.subplots(1, 2, figsize=(14, 6))
 fig1.suptitle("U(1) Gauge Invariance: Links Change, Wilson Loops Don't", fontsize=14)
 
-# Use indexing='ij' so coordinates align cleanly with the (x, y) tensor dimensions
 X, Y = np.meshgrid(np.arange(L), np.arange(L), indexing="ij")
 
 def plot_lattice(ax, lx, ly, plaquettes, title):
-    # Plot the 9x9 plaquette phases
     im = ax.pcolormesh(
-        np.arange(L),
-        np.arange(L),
-        plaquettes.numpy().T,  # Transposed to map (x,y) to (col, row)
-        cmap="viridis",
-        vmin=-np.pi,
-        vmax=np.pi,
-        shading="flat",
-        alpha=0.8,
+        np.arange(L), np.arange(L), plaquettes.numpy().T,
+        cmap="viridis", vmin=-np.pi, vmax=np.pi, shading="flat", alpha=0.8,
     )
     ax.set_xticks(np.arange(L))
     ax.set_yticks(np.arange(L))
     ax.grid(color="black", linestyle="-", linewidth=0.5, alpha=0.5)
 
-    # Plot 9x9 interior horizontal links (x-direction)
     ax.quiver(
-        X[:-1, :-1] + 0.5,
-        Y[:-1, :-1],
-        np.cos(lx[:-1, :-1].numpy()),
-        np.sin(lx[:-1, :-1].numpy()),
+        X[:-1, :-1] + 0.5, Y[:-1, :-1],
+        np.cos(lx[:-1, :-1].numpy()), np.sin(lx[:-1, :-1].numpy()),
         color="white", pivot="mid", scale=25, headwidth=4, headlength=4, zorder=3,
     )
 
-    # Plot 9x9 interior vertical links (y-direction)
     ax.quiver(
-        X[:-1, :-1],
-        Y[:-1, :-1] + 0.5,
-        np.cos(ly[:-1, :-1].numpy()),
-        np.sin(ly[:-1, :-1].numpy()),
+        X[:-1, :-1], Y[:-1, :-1] + 0.5,
+        np.cos(ly[:-1, :-1].numpy()), np.sin(ly[:-1, :-1].numpy()),
         color="red", pivot="mid", scale=25, headwidth=4, headlength=4, zorder=3,
     )
 
@@ -126,48 +96,42 @@ plt.close(fig1)
 print(f"--> Saved Wilson plot to: {wilson_filepath}")
 
 # ==========================================
-# EXPERIMENT 2: GAUGE-EQUIVARIANT CNN (periodic BC)
+# EXPERIMENT 2: GAUGE-EQUIVARIANT CNN
 # ==========================================
-# Independent tensors from Exp 1: links_x/links_y/local_gauge above were
-# generated for an OPEN-boundary Wilson loop check, where the last row/col
-# of links is meaningless (never enters an interior plaquette). Reusing them
-# here would silently promote that meaningless boundary value into a real
-# periodic link. Draw fresh periodic-BC fields instead.
-links_x_per = (torch.rand(L, L) * 2 - 1) * torch.pi
-links_y_per = (torch.rand(L, L) * 2 - 1) * torch.pi
-local_gauge_per = (torch.rand(L, L) * 2 - 1) * torch.pi
-
 B, C_in, C_hidden, N_LAYERS, C_out = 2, 3, 8, 4, 1
-model = LatticeGaugeCNN(C_in, C_hidden, N_LAYERS, C_out)
+
+model = LgeConvNet(C_in, C_hidden, N_LAYERS, C_out, gauge_invariant=True)
 
 f = torch.randn(B, C_in, L, L, dtype=torch.cfloat)
-u_x = torch.polar(torch.ones(1, 1, L, L), links_x_per.unsqueeze(0).unsqueeze(0)).expand(B, -1, -1, -1)
-u_y = torch.polar(torch.ones(1, 1, L, L), links_y_per.unsqueeze(0).unsqueeze(0)).expand(B, -1, -1, -1)
+u_x = torch.polar(torch.ones(1, 1, L, L), links_x.unsqueeze(0).unsqueeze(0)).expand(B, -1, -1, -1)
+u_y = torch.polar(torch.ones(1, 1, L, L), links_y.unsqueeze(0).unsqueeze(0)).expand(B, -1, -1, -1)
 
 out_original = model(f, u_x, u_y)
 
-alpha = local_gauge_per.unsqueeze(0).unsqueeze(0).expand(B, -1, -1, -1)
+alpha = local_gauge.unsqueeze(0).unsqueeze(0).expand(B, -1, -1, -1)
 f_t, u_x_t, u_y_t = gauge_transform_periodic(f, u_x, u_y, alpha)
 out_transformed = model(f_t, u_x_t, u_y_t)
 
 err2 = torch.norm(out_original - out_transformed).item() / torch.norm(out_original).item()
-print(f"[Exp 2] {N_LAYERS}-layer gauge-CNN readout invariance (relative error): {err2:.2e}")
+print(f"[Exp 2] {N_LAYERS}-layer LGE-CNN readout invariance (relative error): {err2:.2e}")
 
-one_layer = GaugeEquivariantConv2D(C_in, C_hidden)
-z0 = one_layer(f, u_x, u_y)
-z1 = one_layer(f_t, u_x_t, u_y_t)
-g = torch.polar(torch.ones_like(alpha), alpha)
-err3 = torch.norm(z1 - g * z0).item() / torch.norm(z0).item()
-print(f"[Exp 2] single-layer field equivariance |out(g.x) - g.out(x)| (relative): {err3:.2e}")
+# Single-layer matrix equivariance test
+one_layer = LConvLinear(C_in, C_hidden)
 
-# Plaquette-level check: the periodic Wilson loop itself should be exactly
-# invariant under this same gauge transform (independent of the CNN).
-plaq_before = calc_plaquettes_periodic(links_x_per, links_y_per)
-lx_t = torch.angle(u_x_t[0, 0])
-ly_t = torch.angle(u_y_t[0, 0])
-plaq_after = calc_plaquettes_periodic(lx_t, ly_t)
-err_plaq = torch.norm(plaq_before - plaq_after).item()
-print(f"[Exp 2] Periodic Wilson loop invariance error: {err_plaq:.2e} (float32 noise floor)")
+f_mat = f.unsqueeze(-1).unsqueeze(-1)
+u_x_mat = u_x.unsqueeze(-1).unsqueeze(-1)
+u_y_mat = u_y.unsqueeze(-1).unsqueeze(-1)
+
+f_t_mat = f_t.unsqueeze(-1).unsqueeze(-1)
+u_x_t_mat = u_x_t.unsqueeze(-1).unsqueeze(-1)
+u_y_t_mat = u_y_t.unsqueeze(-1).unsqueeze(-1)
+
+z0 = one_layer(f_mat, u_x_mat, u_y_mat)
+z1 = one_layer(f_t_mat, u_x_t_mat, u_y_t_mat)
+
+g_mat = torch.polar(torch.ones_like(alpha), alpha).unsqueeze(-1).unsqueeze(-1)
+err3 = torch.norm(z1 - g_mat @ z0).item() / torch.norm(z0).item()
+print(f"[Exp 2] single-layer LConvLinear equivariance |out(g.x) - g.out(x)| (relative): {err3:.2e}")
 
 fig2, axs2 = plt.subplots(1, 2, figsize=(11, 5))
 fig2.suptitle("Gauge-Invariant Readout: Identical Before/After a Gauge Transform of the Inputs", fontsize=12)

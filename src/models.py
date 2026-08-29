@@ -1,98 +1,143 @@
-"""
-Gauge-equivariant CNN ("L-CNN" style, cf. Favoni, Ipp, Muller & Schuh 2020)
-for U(1) lattice gauge theory, periodic boundary conditions.
-"""
-
 import torch
 import torch.nn as nn
 
-
-def _init(out_c, in_c):
+def _init_weights(out_c, in_c):
     return torch.randn(out_c, in_c, dtype=torch.cfloat) * (1.0 / in_c) ** 0.5
 
-
-class GaugeEquivariantConv2D(nn.Module):
+class ParallelTransport(nn.Module):
     """
-    One U(1) lattice gauge-equivariant conv layer (periodic BC), using the
-    full 4-neighbour stencil. Forward neighbours are transported with the
-    site's own link U_mu(n); backward neighbours with U_mu(n-mu)^dagger.
+    Computes exact gauge-equivariant parallel transport using matrix multiplication.
+    Supports U(1) as 1x1 matrices, SU(2) as 2x2, and SU(3) as 3x3.
+    Expects tensors of shape: [Batch, Channels, L, L, Nc, Nc]
     """
+    @staticmethod
+    def forward_transport(w, u, shift_dim):
+        # Transport W from x+mu to x: U_mu(x) W(x+mu) U_mu^dagger(x)
+        w_shifted = torch.roll(w, shifts=-1, dims=shift_dim)
+        u_dagger = u.conj().mT
+        return u @ w_shifted @ u_dagger
 
+    @staticmethod
+    def backward_transport(w, u, shift_dim):
+        # Transport W from x-mu to x: U_mu^dagger(x-mu) W(x-mu) U_mu(x-mu)
+        u_shifted = torch.roll(u, shifts=1, dims=shift_dim)
+        w_shifted = torch.roll(w, shifts=1, dims=shift_dim)
+        u_dagger = u_shifted.conj().mT
+        return u_dagger @ w_shifted @ u_shifted
+
+
+class LConvLinear(nn.Module):
+    """
+    Generalized L-Conv layer (Eq 16 from Holland et al. 2024).
+    Linearly combines local features with their parallel-transported neighbors.
+    """
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.w_center = nn.Parameter(_init(out_channels, in_channels))
-        self.w_fwd_x = nn.Parameter(_init(out_channels, in_channels))
-        self.w_bwd_x = nn.Parameter(_init(out_channels, in_channels))
-        self.w_fwd_y = nn.Parameter(_init(out_channels, in_channels))
-        self.w_bwd_y = nn.Parameter(_init(out_channels, in_channels))
+        self.w_center = nn.Parameter(_init_weights(out_channels, in_channels))
+        self.w_fwd_x = nn.Parameter(_init_weights(out_channels, in_channels))
+        self.w_bwd_x = nn.Parameter(_init_weights(out_channels, in_channels))
+        self.w_fwd_y = nn.Parameter(_init_weights(out_channels, in_channels))
+        self.w_bwd_y = nn.Parameter(_init_weights(out_channels, in_channels))
 
-    def forward(self, f, u_x, u_y):
-        # f: (B, C_in, L, L) complex. u_x, u_y: (B, 1, L, L) complex, |u| = 1.
-        f_fwd_x = u_x * torch.roll(f, shifts=-1, dims=2)
-        f_bwd_x = torch.conj(torch.roll(u_x, shifts=1, dims=2)) * torch.roll(f, shifts=1, dims=2)
-        f_fwd_y = u_y * torch.roll(f, shifts=-1, dims=3)
-        f_bwd_y = torch.conj(torch.roll(u_y, shifts=1, dims=3)) * torch.roll(f, shifts=1, dims=3)
+    def forward(self, w, u_x, u_y):
+        # w: [B, C_in, L, L, Nc, Nc]
+        # u_x, u_y: [B, 1, L, L, Nc, Nc]
+        
+        w_fwd_x = ParallelTransport.forward_transport(w, u_x, shift_dim=2)
+        w_bwd_x = ParallelTransport.backward_transport(w, u_x, shift_dim=2)
+        w_fwd_y = ParallelTransport.forward_transport(w, u_y, shift_dim=3)
+        w_bwd_y = ParallelTransport.backward_transport(w, u_y, shift_dim=3)
 
-        out = torch.einsum('oi,bixy->boxy', self.w_center, f)
-        out = out + torch.einsum('oi,bixy->boxy', self.w_fwd_x, f_fwd_x)
-        out = out + torch.einsum('oi,bixy->boxy', self.w_bwd_x, f_bwd_x)
-        out = out + torch.einsum('oi,bixy->boxy', self.w_fwd_y, f_fwd_y)
-        out = out + torch.einsum('oi,bixy->boxy', self.w_bwd_y, f_bwd_y)
+        # Einsum handles the channel mixing while preserving the spatial and NcxNc dimensions
+        out = torch.einsum('oi,bixy...->boxy...', self.w_center, w)
+        out = out + torch.einsum('oi,bixy...->boxy...', self.w_fwd_x, w_fwd_x)
+        out = out + torch.einsum('oi,bixy...->boxy...', self.w_bwd_x, w_bwd_x)
+        out = out + torch.einsum('oi,bixy...->boxy...', self.w_fwd_y, w_fwd_y)
+        out = out + torch.einsum('oi,bixy...->boxy...', self.w_bwd_y, w_bwd_y)
         return out
 
 
-class ModEquivariantActivation(nn.Module):
+class MatrixTrNorm(nn.Module):
     """
-    Gauge-equivariant nonlinearity (lattice analogue of complex modReLU):
-    acts on the magnitude only and keeps the phase, so it commutes with
-    any per-site U(1) phase multiplication.
+    Trace Normalization adapted for matrix traces.
+    Normalizes the feature maps by the spatial mean of the matrix trace magnitude.
     """
-
-    def __init__(self, channels, eps=1e-6):
+    def __init__(self, eps=1e-5):
         super().__init__()
-        self.bias = nn.Parameter(torch.zeros(channels))
         self.eps = eps
 
-    def forward(self, z):
-        mag = z.abs()
-        scale = torch.relu(mag + self.bias.view(1, -1, 1, 1)) / (mag + self.eps)
-        return z * scale
+    def forward(self, w):
+        # Compute the trace over the Nc x Nc dimensions
+        tr_w = torch.diagonal(w, dim1=-2, dim2=-1).sum(-1)
+        mag_sq = tr_w.real**2 + tr_w.imag**2
+        mean_mag = torch.mean(mag_sq, dim=(2, 3), keepdim=True)
+        scale = torch.rsqrt(mean_mag + self.eps)
+        # Reshape scale to broadcast across the NcxNc dimensions
+        return w * scale.unsqueeze(-1).unsqueeze(-1)
 
 
-class GaugeInvariantReadout(nn.Module):
+class PlaquetteMatrixLayer(nn.Module):
     """
-    |z|^2 per channel is invariant under *local* U(1) gauge transforms
-    (since |g(n)| = 1 pointwise), so a real-valued linear layer can mix
-    those magnitudes freely into any output (regression targets, class
-    logits, an energy density map, etc) without reintroducing gauge
-    dependence.
+    Computes 1x1 Wilson loops using exact non-commutative matrix multiplication.
     """
-
-    def __init__(self, in_channels, out_features):
+    def __init__(self):
         super().__init__()
-        self.linear = nn.Linear(in_channels, out_features)
 
-    def forward(self, z):
-        inv = (z.real ** 2 + z.imag ** 2).permute(0, 2, 3, 1)   # (B, L, L, C), invariant
-        return self.linear(inv).permute(0, 3, 1, 2)              # (B, out_features, L, L)
+    def forward(self, u_x, u_y):
+        # P_xy = U_x(x) @ U_y(x+x) @ U_x^dagger(x+y) @ U_y^dagger(x)
+        u_y_fwd_x = torch.roll(u_y, shifts=-1, dims=2)
+        u_x_fwd_y = torch.roll(u_x, shifts=-1, dims=3)
+        
+        p_xy = u_x @ u_y_fwd_x @ u_x_fwd_y.conj().mT @ u_y.conj().mT
+        return p_xy
 
 
-class LatticeGaugeCNN(nn.Module):
-    """Stack of gauge-equivariant conv+activation layers, invariant head."""
-
-    def __init__(self, in_channels, hidden_channels, n_layers, out_features):
+class LgeConvNet(nn.Module):
+    """
+    SU(N)-ready Lattice-Gauge-Equivariant CNN architecture.
+    """
+    def __init__(self, in_channels, hidden_channels, n_layers, out_features, gauge_invariant=True):
         super().__init__()
-        chans = [in_channels] + [hidden_channels] * n_layers
-        self.layers = nn.ModuleList(
-            [GaugeEquivariantConv2D(chans[i], chans[i + 1]) for i in range(n_layers)]
-        )
-        self.acts = nn.ModuleList(
-            [ModEquivariantActivation(chans[i + 1]) for i in range(n_layers)]
-        )
-        self.readout = GaugeInvariantReadout(chans[-1], out_features)
+        self.gauge_invariant = gauge_invariant
+        self.plaquette_layer = PlaquetteMatrixLayer()
+        
+        chans = [in_channels + 1] + [hidden_channels] * n_layers
+        self.blocks = nn.ModuleList()
+        
+        for i in range(n_layers):
+            self.blocks.append(nn.ModuleDict({
+                'conv': LConvLinear(chans[i], chans[i+1]),
+                'norm': MatrixTrNorm()
+            }))
+            
+        if self.gauge_invariant:
+            self.readout = nn.Linear(chans[-1], out_features)
 
     def forward(self, f, u_x, u_y):
-        z = f
-        for layer, act in zip(self.layers, self.acts):
-            z = act(layer(z, u_x, u_y))
-        return self.readout(z)
+        # Format adapter: if inputs are [B, C, L, L] scalars, unsqueeze to [B, C, L, L, 1, 1] matrices
+        if f.dim() == 4:
+            f = f.unsqueeze(-1).unsqueeze(-1)
+            u_x = u_x.unsqueeze(-1).unsqueeze(-1)
+            u_y = u_y.unsqueeze(-1).unsqueeze(-1)
+
+        # 1. Compute Matrix Plaquette
+        p_xy = self.plaquette_layer(u_x, u_y)
+        
+        # 2. Append Plaquette to input features
+        z = torch.cat([f, p_xy], dim=1)
+        
+        # 3. Hidden Blocks with Normalization
+        # Matrix trace normalization stabilizes gradients in deep gauge-equivariant networks
+        for block in self.blocks:
+            z = block['conv'](z, u_x, u_y)
+            z = block['norm'](z)  # Re-enabled: critical for gradient stability
+            
+        # 4. Invariant Readout: Take the trace of the final matrices
+        if self.gauge_invariant:
+            tr_z = torch.diagonal(z, dim1=-2, dim2=-1).sum(-1)
+            inv = (tr_z.real**2 + tr_z.imag**2).permute(0, 2, 3, 1) # [B, L, L, C]
+            out = self.readout(inv).permute(0, 3, 1, 2)             # [B, out_features, L, L]
+            return out
+            
+        # If not invariant, return the raw [B, C, L, L, Nc, Nc] tensor field
+        return z

@@ -1,6 +1,6 @@
 """
 Physical observables for U(1) lattice gauge theory: plaquettes / Wilson
-loops, plus a slot for topological charge.
+loops, topological charge, and the Wilson gauge action.
 """
 
 import torch
@@ -33,6 +33,27 @@ def calc_plaquettes_periodic(lx, ly):
     return wrap(p)
 
 
-# TODO: topological_charge(lx, ly) -- sum of wrapped plaquette phases / 2*pi,
-# once needed for a specific experiment. Use calc_plaquettes_periodic for
-# a well-defined (boundary-free) total winding number.
+def calc_topological_charge(lx, ly):
+    """
+    Computes the topological winding number Q of the 2D U(1) lattice.
+    Uses periodic boundary conditions to ensure a well-defined, boundary-free 
+    total winding number.
+    
+    Q = (1 / 2*pi) * Sum(wrapped_plaquettes)
+    """
+    p = calc_plaquettes_periodic(lx, ly)
+    Q = torch.sum(p) / (2 * torch.pi)
+    # The physical topological charge must be an integer
+    return torch.round(Q)
+
+
+def calc_wilson_action(plaquettes, beta=1.0):
+    """
+    Computes the standard U(1) Wilson gauge action.
+    
+    S = beta * Sum(1 - cos(P_munu))
+    
+    This acts as the fundamental physics-informed loss function when training 
+    generative models or solving for field configurations.
+    """
+    return beta * torch.sum(1.0 - torch.cos(plaquettes))
