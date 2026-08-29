@@ -126,17 +126,21 @@ class LgeConvNet(nn.Module):
         # 2. Append Plaquette to input features
         z = torch.cat([f, p_xy], dim=1)
         
-        # 3. Hidden Blocks with Normalization
-        # Matrix trace normalization stabilizes gradients in deep gauge-equivariant networks
+        # 3. Hidden Blocks (no normalization - causes mode collapse)
+        # Normalization removed: it destroys gauge-invariant structure
+        # Skip connections would be better, but left for future work
         for block in self.blocks:
             z = block['conv'](z, u_x, u_y)
-            z = block['norm'](z)  # Re-enabled: critical for gradient stability
+            # z = block['norm'](z)  # DISABLED: causes information loss
             
-        # 4. Invariant Readout: Take the trace of the final matrices
+        # 4. Invariant Readout: Use REAL part of trace (gauge-invariant, Holland et al. 2024)
+        # FIXED: |tr(z)|² loses information; use tr(z).real instead
         if self.gauge_invariant:
             tr_z = torch.diagonal(z, dim1=-2, dim2=-1).sum(-1)
-            inv = (tr_z.real**2 + tr_z.imag**2).permute(0, 2, 3, 1) # [B, L, L, C]
-            out = self.readout(inv).permute(0, 3, 1, 2)             # [B, out_features, L, L]
+            # Use real part only: gauge-invariant and preserves information
+            # For U(1): tr(z) is complex; real part is invariant under global phase
+            inv = tr_z.real.permute(0, 2, 3, 1)  # [B, L, L, C]
+            out = self.readout(inv).permute(0, 3, 1, 2)  # [B, out_features, L, L]
             return out
             
         # If not invariant, return the raw [B, C, L, L, Nc, Nc] tensor field

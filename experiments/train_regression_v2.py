@@ -55,16 +55,21 @@ def generate_langevin_u1_batch(beta_tensor, batch_size, L, steps=150, dt=0.02):
         u_x = torch.polar(torch.ones_like(lx), lx).unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
         u_y = torch.polar(torch.ones_like(ly), ly).unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
         
-        # Use physical input features: action density (Wilson loop characteristic scale)
-        # f encodes the local action landscape, providing rich input signal to CNN
-        f = torch.ones(batch_size, 1, L, L, 1, 1, dtype=torch.cfloat) * (1.0 - torch.cos(p_final).mean() * 0.1).unsqueeze(-1).unsqueeze(-1)
+        # Use LOCAL plaquette values as input features (gauge-invariant)
+        # CRITICAL FIX: spatial structure prevents mode collapse
+        # Local 1 - cos(P) encodes action density at each site
+        p_local = p_final  # [B, L, L] local plaquette phases
+        f_spatial = 1.0 - 0.5 * torch.cos(p_local)  # [B, L, L] gauge-invariant scalars
+        f = f_spatial.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)  # [B, 1, L, L, 1, 1]
         
     return f, u_x, u_y, avg_plaquettes
 
 # ==========================================
 # 2. MODEL, OPTIMIZER & LOSS INITIALIZATION
 # ==========================================
-model = LgeConvNet(in_channels=1, hidden_channels=16, n_layers=3, out_features=1, gauge_invariant=True)
+# INCREASED CAPACITY: Was 16 hidden channels, now 32 (double)
+# 3→4 layers provides more expressive power
+model = LgeConvNet(in_channels=1, hidden_channels=32, n_layers=4, out_features=1, gauge_invariant=True)
 optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
 criterion = nn.MSELoss()
 
@@ -168,3 +173,25 @@ plt.grid(True, linestyle=':', alpha=0.6)
 plot_path = os.path.join(ROOT_DIR, "output_plots", "regression_scatter.jpg")
 plt.savefig(plot_path, dpi=200, bbox_inches='tight')
 print(f"Saved evaluation scatter plot to: {plot_path}")
+true_beta = sample_beta_physical(1000)
+
+f, ux, uy, plaq = generate_langevin_u1_batch(
+    true_beta.view(-1),
+    1000,
+    L,
+    steps=200,
+    dt=0.02
+)
+
+print("Beta range:", true_beta.min().item(), true_beta.max().item())
+print("Plaquette range:", plaq.min().item(), plaq.max().item())
+
+plt.scatter(
+    true_beta.view(-1).numpy(),
+    plaq.numpy()
+)
+
+plt.xlabel("Beta")
+plt.ylabel("Average Plaquette")
+plt.grid(True)
+plt.show()
